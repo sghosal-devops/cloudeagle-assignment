@@ -89,42 +89,51 @@ For strict cost control in early QA environments, a small shared Atlas tier can 
 ### VPC Layout
 
 ```
-VPC: sync-vpc
-  ├── serverless-connector-subnet
-  │     └── Serverless VPC Access connector
+VPC: sync-vpc  (10.0.0.0/16)
   │
-  ├── private-services-subnet
-  │     └── Private Service Connect endpoint to MongoDB Atlas
+  ├── serverless-connector-subnet  10.0.1.0/28
+  │     └── Serverless VPC Access connector  (e2-micro, min 2 / max 10 instances)
+  │           └── Cloud Run egress → this connector → private VPC resources
   │
-  └── management subnet
-        └── optional bastion/admin tooling
+  ├── private-services-subnet  10.0.2.0/24
+  │     └── Private Service Connect endpoint for MongoDB Atlas
+  │           └── atlas.internal → 10.0.2.10  (Cloud DNS private zone)
+  │
+  └── management-subnet  10.0.3.0/28
+        └── Cloud NAT gateway  (controlled egress to external APIs)
 ```
 
 ### Ingress
 
-For production:
+| Environment | Ingress config | Restriction |
+|---|---|---|
+| QA | Cloud Run managed HTTPS | IAM: `run.invoker` on QA service account only — no public access |
+| Staging | Cloud Run managed HTTPS | Cloud Armor allowlist: office IP + CI agent IP only |
+| Production | External HTTPS LB + Cloud Armor + serverless NEG | Public HTTPS with WAF, rate limit 500 req/min/IP |
 
-- Cloud Run receives HTTPS traffic through a custom domain.
-- Cloud Run's managed HTTPS endpoint handles TLS.
-- If WAF/rate limiting is required, place an External HTTPS Load Balancer with Cloud Armor in front of Cloud Run using a serverless NEG.
+**Production ingress path:**
+```
+Client → Cloud Armor (WAF + rate limit) → External HTTPS Load Balancer
+       → Serverless NEG → Cloud Run revision (managed TLS terminates at LB)
+```
 
-Recommended ingress policy:
+Cloud Armor rules applied to production:
+- OWASP Core Rule Set (managed rule group)
+- Rate limit: 500 requests/minute per source IP
+- Block known malicious IP lists (Google Threat Intelligence feed)
 
-| Environment | Ingress |
-|---|---|
-| QA | Internal or restricted access |
-| Staging | Restricted by IAM or Cloud Armor allowlist |
-| Prod | Public HTTPS through Cloud Run or Load Balancer + Cloud Armor |
+### Firewall Rules
+
+| Rule name | Direction | Source | Target | Ports | Purpose |
+|---|---|---|---|---|---|
+| `allow-connector-to-atlas` | Egress | VPC connector subnet | PSC endpoint | 27017/TCP | MongoDB traffic |
+| `allow-connector-to-nat` | Egress | VPC connector subnet | Cloud NAT | 443/TCP | External API calls |
+| `deny-all-egress` | Egress | All | All | All | Default deny; above rules are exceptions |
+| `allow-health-checks` | Ingress | 35.191.0.0/16, 130.211.0.0/22 | LB backend | 8080/TCP | GCP LB health checks |
 
 ### Egress to MongoDB
 
-Cloud Run uses a **Serverless VPC Access connector** to reach private resources in the VPC. MongoDB Atlas is exposed through **Private Service Connect**, so database traffic stays private and does not traverse the public internet.
-
-Egress settings:
-
-- Route private ranges through the VPC connector.
-- Use Cloud NAT only if the service needs controlled outbound internet access to external APIs.
-- Keep MongoDB allowlists restricted to private endpoint connectivity, not broad public IPs.
+Cloud Run uses the **Serverless VPC Access connector** to reach the private VPC. MongoDB Atlas is exposed via **Private Service Connect** — a private endpoint in `10.0.2.0/24` that maps to the Atlas cluster. A Cloud DNS private zone resolves `atlas.internal` to `10.0.2.10` inside the VPC. Database traffic never leaves Google's network.
 
 ---
 
@@ -170,25 +179,86 @@ Use separate service accounts per environment:
 
 ## 6. Deployment & Autoscaling Model
 
-Cloud Run deployment creates a new immutable revision for every image.
+### Connection to Part 1 CI/CD Pipeline
 
-For QA/staging:
+The same Jenkins pipeline from Part 1 builds and pushes the Docker image. The only difference for Cloud Run is the **deploy step**: instead of `deploy.sh` (which SSHes into VMs), the pipeline calls `gcloud run deploy`. The image is identical — no rebuild.
 
-- Deploy new revision.
-- Send 100% traffic after health checks or smoke tests.
-- Roll back by shifting traffic back to the previous revision.
+```
+Jenkins (Part 1 pipeline)
+  │
+  ├── mvn clean package
+  ├── docker build → gcr.io/cloudeagle-prod/sync-service:<sha>
+  ├── trivy image scan (fail on HIGH/CRITICAL CVE)
+  ├── docker push gcr.io/cloudeagle-prod/sync-service:<sha>
+  │
+  └── Deploy to Cloud Run:
+        gcloud run deploy sync-service \
+          --image=gcr.io/cloudeagle-prod/sync-service:<sha> \
+          --region=us-central1 \
+          --service-account=sync-service-prod@cloudeagle-prod.iam.gserviceaccount.com \
+          --no-traffic \          ← new revision starts with 0% user traffic
+          --tag=candidate \       ← gives a stable URL for smoke testing
+          --project=cloudeagle-prod
+```
 
-For production:
+### Deployment Flow per Environment
 
-- Deploy a new revision with **0% traffic**.
-- Run smoke tests against the tagged revision URL.
-- If healthy, shift traffic gradually:
-  - 10% canary
-  - 50%
-  - 100%
-- Roll back instantly by sending traffic back to the previous revision.
+**QA / Staging** — shift 100% traffic immediately after smoke test:
 
-This gives blue/green or canary-style behavior without maintaining two VM groups or a Kubernetes cluster.
+```bash
+# 1. Deploy new revision (no traffic)
+gcloud run deploy sync-service \
+  --image=gcr.io/cloudeagle-prod/sync-service:<sha> \
+  --region=us-central1 --no-traffic --tag=candidate
+
+# 2. Smoke test against the tagged revision URL
+curl -sf "$(gcloud run services describe sync-service \
+  --region=us-central1 --format='value(status.address.url)')-candidate/actuator/health" \
+  | grep -q '"status":"UP"'
+
+# 3. Shift all traffic
+gcloud run services update-traffic sync-service \
+  --region=us-central1 --to-latest
+```
+
+**Production** — gradual canary shift with rollback at each step:
+
+```bash
+# Step 1: 10% canary
+gcloud run services update-traffic sync-service \
+  --region=us-central1 \
+  --to-revisions=LATEST=10,PREVIOUS=90
+
+# Step 2: 50%
+gcloud run services update-traffic sync-service \
+  --region=us-central1 \
+  --to-revisions=LATEST=50,PREVIOUS=50
+
+# Step 3: 100% (full cutover)
+gcloud run services update-traffic sync-service \
+  --region=us-central1 --to-latest
+```
+
+**Rollback** (any stage — completes in < 2 seconds):
+
+```bash
+gcloud run services update-traffic sync-service \
+  --region=us-central1 \
+  --to-revisions=<previous-revision>=100
+```
+
+Cloud Run keeps all previous revisions available indefinitely (or until manually deleted). Rollback requires no image rebuilding — it just updates a traffic split record.
+
+### Why this is better than VM blue/green for a startup
+
+| Aspect | VM Blue/Green (Part 1) | Cloud Run Canary |
+|---|---|---|
+| Idle resource cost | Second MIG running at all times | Zero — Cloud Run scales to 0 |
+| Rollback time | <5s (LB backend flip) | <2s (traffic split update) |
+| Mixed-version window | No (atomic switch) | Yes, intentionally (canary) |
+| Infrastructure to manage | MIG, LB backend, active-slot.json | Nothing — fully managed |
+
+For a startup, Cloud Run canary is a strict improvement: instant rollback with no always-on idle resources.
 
 ---
 
@@ -270,7 +340,76 @@ The main fixed cost is MongoDB Atlas. Compute stays small until traffic grows.
 
 ---
 
-## 9. When To Move To GKE Later
+## 9. Infrastructure as Code
+
+All Cloud Run resources are fully manageable via Terraform using the `google_cloud_run_v2_service` resource. Key resources to provision:
+
+```hcl
+# Cloud Run service
+resource "google_cloud_run_v2_service" "sync_service" {
+  name     = "sync-service"
+  location = var.region
+  project  = var.project_id
+
+  ingress = "INGRESS_TRAFFIC_ALL"
+
+  template {
+    service_account = google_service_account.app.email
+
+    scaling {
+      min_instance_count = var.environment == "prod" ? 1 : 0
+      max_instance_count = 20
+    }
+
+    vpc_access {
+      connector = google_vpc_access_connector.connector.id
+      egress    = "PRIVATE_RANGES_ONLY"
+    }
+
+    containers {
+      image = var.app_container_image   # Set by Jenkins on each deploy
+
+      resources {
+        limits   = { cpu = "1", memory = "2Gi" }
+        cpu_idle = true                 # CPU only allocated during request handling
+      }
+
+      env {
+        name  = "SPRING_PROFILES_ACTIVE"
+        value = var.environment
+      }
+
+      env {
+        name = "MONGODB_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.mongodb_password.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      liveness_probe {
+        http_get { path = "/actuator/health/liveness" }
+        initial_delay_seconds = 30
+        period_seconds        = 10
+      }
+
+      startup_probe {
+        http_get { path = "/actuator/health/liveness" }
+        failure_threshold = 30
+        period_seconds    = 10
+      }
+    }
+  }
+}
+```
+
+IAM, VPC connector, Private Service Connect endpoint, and Cloud Armor policy are all expressed in Terraform alongside the service, giving full reproducibility across environments.
+
+---
+
+## 10. When To Migrate To GKE Autopilot
 
 Cloud Run should be the starting architecture. Move to **GKE Autopilot** later if:
 

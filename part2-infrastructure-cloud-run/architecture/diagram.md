@@ -74,34 +74,77 @@ graph TB
     MON --> ALERT
 ```
 
-## Deployment Flow
+## Full CI/CD → Cloud Run Deployment Flow
 
 ```mermaid
 sequenceDiagram
+    participant Dev as Developer
+    participant GH as GitHub
     participant Jenkins
-    participant AR as Artifact Registry
+    participant SQ as SonarQube
+    participant Trivy
+    participant AR as GCR / Artifact Registry
     participant CR as Cloud Run
     participant NewRev as New Revision
     participant OldRev as Previous Revision
-    participant Atlas as MongoDB Atlas
+    participant Atlas as MongoDB Atlas (PSC)
+    participant Slack
 
-    Jenkins->>AR: Push image sync-service:<sha>
-    Jenkins->>CR: Deploy new revision with 0% traffic
-    CR->>NewRev: Start revision
-    NewRev->>Atlas: Verify MongoDB connectivity through PSC
-    Jenkins->>NewRev: Smoke test tagged revision URL
-
-    alt Smoke tests pass
-        Jenkins->>CR: Shift 10% traffic to new revision
-        Jenkins->>CR: Shift 50% traffic
-        Jenkins->>CR: Shift 100% traffic
-        CR-->>NewRev: New revision active
-    else Smoke tests fail
-        Jenkins->>CR: Keep 100% traffic on previous revision
-        CR-->>OldRev: No user traffic sent to failed revision
+    Dev->>GH: git push → PR opened
+    GH->>Jenkins: webhook → Jenkinsfile.pr
+    Jenkins->>Jenkins: mvn clean package
+    par parallel
+        Jenkins->>Jenkins: mvn test (unit tests + JaCoCo)
+    and
+        Jenkins->>SQ: mvn sonar:sonar (PR decoration)
+    and
+        Jenkins->>Jenkins: OWASP dependency-check
     end
+    Jenkins->>Jenkins: docker build (local only — not pushed)
+    Jenkins->>Trivy: trivy image (HIGH/CRITICAL CVE scan)
+    Trivy-->>Jenkins: SARIF report
+    Jenkins->>GH: post check status (pass/fail)
 
-    alt Post-deploy health fails
-        Jenkins->>CR: Roll back traffic to previous revision
+    Dev->>GH: PR approved → merge to main
+    GH->>Jenkins: webhook → Jenkinsfile
+    Jenkins->>Jenkins: mvn clean package -DskipTests
+    Jenkins->>Jenkins: mvn test + sonar + owasp (parallel)
+    Jenkins->>SQ: waitForQualityGate
+    Jenkins->>Jenkins: docker build → gcr.io/.../sync-service:<sha>
+    Jenkins->>Trivy: trivy image scan (fail pipeline on CVE)
+    Jenkins->>AR: docker push gcr.io/.../sync-service:<sha>
+
+    Note over Jenkins: Manual approval gate (release-managers + change ticket)
+
+    Jenkins->>CR: gcloud run deploy --no-traffic --tag=candidate
+    CR->>NewRev: Start new revision (0% traffic)
+    NewRev->>Atlas: MongoDB connectivity check via PSC
+    Jenkins->>NewRev: curl smoke test on tagged revision URL
+    NewRev-->>Jenkins: HTTP 200 + status=UP
+
+    Jenkins->>CR: update-traffic --to-revisions=NEW=10,OLD=90
+    Jenkins->>CR: update-traffic --to-revisions=NEW=50,OLD=50
+    Jenkins->>CR: update-traffic --to-latest (100%)
+    CR-->>NewRev: New revision serves all traffic
+    Jenkins->>Slack: Deployment complete notification
+
+    alt Any step fails
+        Jenkins->>CR: update-traffic --to-revisions=OLD=100
+        CR-->>OldRev: Full rollback in <2 seconds
+        Jenkins->>Slack: Rollback alert with failure details
     end
+```
+
+## Secrets Injection Flow
+
+```mermaid
+graph LR
+    SM[Google Secret Manager<br/>sync-service-prod-mongodb-password]
+    SA[Cloud Run Service Account<br/>sync-service-prod@...]
+    CR[Cloud Run revision<br/>sync-service]
+    APP[Spring Boot app<br/>reads MONGODB_PASSWORD<br/>from env]
+
+    SA -->|roles/secretmanager.secretAccessor| SM
+    SM -->|injected as env var at revision start| CR
+    CR --> APP
 ```
