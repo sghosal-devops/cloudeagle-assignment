@@ -1,0 +1,244 @@
+#!/usr/bin/env groovy
+
+// ============================================================
+//  sync-service — Pull Request Validation Pipeline
+//  Target infrastructure: GCP Compute Engine VMs running Docker
+//
+//  Jenkins agent: same 'gcp-build-agent' VM pool as main pipeline.
+//  Tools on agent: JDK 17, Maven 3.9, Docker Engine, Trivy.
+//
+//  Triggered by: GitHub pull_request webhook (open, synchronize, reopen)
+//
+//  Purpose:
+//    Fast developer feedback — build, test, quality scan, image scan.
+//    The Docker image is built and scanned locally on the agent.
+//    NO image push to GCR. NO deployment to any VM.
+//
+//  Results posted as required GitHub check statuses on the PR.
+// ============================================================
+
+pipeline {
+
+    agent {
+        label 'gcp-build-agent'
+    }
+
+    tools {
+        jdk   'JDK-17'
+        maven 'Maven-3.9'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds(abortPrevious: true)
+    }
+
+    environment {
+        APP_NAME    = 'sync-service'
+        GCR_HOST    = 'gcr.io'
+        GCP_PROJECT = 'cloudeagle-prod'
+        IMAGE_NAME  = "gcr.io/cloudeagle-prod/sync-service"
+        MAVEN_OPTS  = '-Xmx1536m -Djava.awt.headless=true'
+        SONAR_TOKEN = credentials('sonarqube-token')
+        PR_NUMBER   = env.CHANGE_ID ?: 'unknown'
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  STAGES
+    // ══════════════════════════════════════════════════════════════════════════
+
+    stages {
+
+        // ── 1. Checkout ────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHA     = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.GIT_AUTHOR  = sh(script: 'git log -1 --format="%an <%ae>"', returnStdout: true).trim()
+                    env.GIT_MESSAGE = sh(script: 'git log -1 --format="%s"', returnStdout: true).trim()
+                    // Local-only image tag — never pushed to GCR
+                    env.IMAGE_TAG   = "${env.IMAGE_NAME}:pr-${env.PR_NUMBER}-${env.GIT_SHA}"
+                    echo "PR #${env.PR_NUMBER} | SHA: ${env.GIT_SHA} | ${env.GIT_AUTHOR}"
+                }
+            }
+        }
+
+        // ── 2. Build JAR ───────────────────────────────────────────────────────
+        stage('Build') {
+            steps {
+                sh '''
+                    mvn clean package \
+                      -DskipTests \
+                      --batch-mode \
+                      --no-transfer-progress
+                '''
+            }
+        }
+
+        // ── 3. Verify — parallel ───────────────────────────────────────────────
+        stage('Verify') {
+            parallel {
+
+                stage('Unit Tests') {
+                    steps {
+                        sh '''
+                            mvn test \
+                              --batch-mode \
+                              --no-transfer-progress \
+                              -Dspring.profiles.active=test
+                        '''
+                    }
+                    post {
+                        always {
+                            junit testResults: 'target/surefire-reports/*.xml', allowEmptyResults: false
+                            recordCoverage(
+                                tools: [[parser: 'JACOCO', pattern: 'target/site/jacoco/jacoco.xml']],
+                                qualityGates: [
+                                    [threshold: 70.0, metric: 'LINE',   baseline: 'PROJECT'],
+                                    [threshold: 70.0, metric: 'BRANCH', baseline: 'PROJECT']
+                                ]
+                            )
+                        }
+                    }
+                }
+
+                stage('Static Analysis') {
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            // PR decoration: SonarQube posts inline comments on the PR
+                            sh """
+                                mvn sonar:sonar \
+                                  -Dsonar.projectKey=${APP_NAME} \
+                                  -Dsonar.pullrequest.key=${env.PR_NUMBER} \
+                                  -Dsonar.pullrequest.branch=${env.CHANGE_BRANCH} \
+                                  -Dsonar.pullrequest.base=${env.CHANGE_TARGET} \
+                                  --batch-mode \
+                                  --no-transfer-progress
+                            """
+                        }
+                    }
+                }
+
+                stage('Dependency Audit') {
+                    steps {
+                        sh '''
+                            mvn org.owasp:dependency-check-maven:9.0.9:check \
+                              -DfailBuildOnCVSS=8 \
+                              -DsuppressionFile=.owasp-suppressions.xml \
+                              --batch-mode \
+                              --no-transfer-progress
+                        '''
+                    }
+                    post {
+                        always {
+                            publishHTML([
+                                allowMissing: true,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'target',
+                                reportFiles: 'dependency-check-report.html',
+                                reportName: 'OWASP Dependency Check'
+                            ])
+                        }
+                    }
+                }
+
+            } // end parallel
+        }
+
+        // ── 4. Quality Gate ────────────────────────────────────────────────────
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ── 5. Docker Build ────────────────────────────────────────────────────
+        // Image is built locally on the agent — NOT pushed to GCR for PRs.
+        // The image is only used for the security scan below, then discarded.
+        stage('Docker Build') {
+            steps {
+                sh """
+                    cp target/*.jar target/sync-service.jar
+
+                    docker build \
+                      --file part1-cicd/Dockerfile \
+                      --build-arg BUILD_DATE="\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                      --build-arg VCS_REF=${env.GIT_SHA} \
+                      --tag ${env.IMAGE_TAG} \
+                      .
+
+                    echo "Image built (local only, will NOT be pushed): ${env.IMAGE_TAG}"
+                """
+            }
+        }
+
+        // ── 6. Security Scan — Docker image CVE scan ───────────────────────────
+        // Scans the locally-built image for OS package and dependency CVEs.
+        // Fails the PR if any unfixed HIGH or CRITICAL CVE is found.
+        stage('Security Scan') {
+            steps {
+                sh """
+                    trivy image \
+                      --exit-code 1 \
+                      --severity HIGH,CRITICAL \
+                      --ignore-unfixed \
+                      --format sarif \
+                      --output trivy-results.sarif \
+                      --timeout 15m \
+                      ${env.IMAGE_TAG}
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-results.sarif', allowEmptyArchive: true
+                    recordIssues(
+                        tools: [sarif(pattern: 'trivy-results.sarif', id: 'trivy', name: 'Trivy CVEs')],
+                        qualityGates: [[threshold: 1, type: 'TOTAL_ERROR']]
+                    )
+                }
+            }
+        }
+
+    } // end stages
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  POST
+    // ══════════════════════════════════════════════════════════════════════════
+
+    post {
+        success {
+            script {
+                pullRequest.createStatus(
+                    status: 'success',
+                    context: 'jenkins/ci',
+                    description: 'All CI checks passed: build, tests, quality gate, image CVE scan',
+                    targetUrl: env.BUILD_URL
+                )
+            }
+        }
+
+        failure {
+            script {
+                pullRequest.createStatus(
+                    status: 'failure',
+                    context: 'jenkins/ci',
+                    description: "CI failed at stage: ${env.STAGE_NAME}",
+                    targetUrl: env.BUILD_URL
+                )
+            }
+        }
+
+        always {
+            // Remove the locally built PR image — was never pushed, just used for scanning
+            sh "docker rmi ${env.IMAGE_TAG} 2>/dev/null || true"
+            cleanWs(notFailBuild: true)
+        }
+    }
+}

@@ -1,0 +1,588 @@
+#!/usr/bin/env groovy
+
+// ============================================================
+//  sync-service — Jenkins Declarative Pipeline
+//  Target infrastructure: GCP Compute Engine VMs running Docker
+//
+//  Jenkins agent: GCP VM (label: gcp-build-agent) with these tools
+//  pre-installed: JDK 17, Maven 3.9, Docker Engine, gcloud SDK, Trivy.
+//
+//  Full flow:
+//    1. Maven builds the JAR
+//    2. Docker builds the image (packages the JAR)
+//    3. Trivy scans the image for CVEs
+//    4. Image pushed to GCR (gcr.io/cloudeagle-prod/sync-service:{sha})
+//    5. Jenkins SSHes into VMs via Cloud IAP (OS Login — no static keys)
+//    6. VMs: docker pull + docker run (replacing the running container)
+//
+//  Branch → Environment:
+//    develop  → qa       (rolling, auto-deploy)
+//    staging  → staging  (rolling, auto-deploy)
+//    main     → prod     (blue/green, manual approval gate)
+// ============================================================
+
+def resolveEnv(String branch) {
+    if (branch == 'main')    return 'prod'
+    if (branch == 'staging') return 'staging'
+    return 'qa'
+}
+
+def shortSha() {
+    return env.GIT_COMMIT ? env.GIT_COMMIT[0..7] : 'unknown'
+}
+
+pipeline {
+
+    // ── Build agent ────────────────────────────────────────────────────────────
+    // GCP Compute Engine VM registered in Jenkins via the GCE plugin or SSH.
+    // The 'gcp-build-agent' label maps to an instance template that has:
+    //   - Docker Engine (docker build, docker push)
+    //   - gcloud SDK  (GCR auth, IAP SSH to deploy VMs)
+    //   - JDK 17 + Maven 3.9 (Maven build)
+    //   - Trivy (image CVE scanning)
+    // The VM's GCP service account authenticates to GCR via the metadata server
+    // — no docker login credentials stored in Jenkins.
+    agent {
+        label 'gcp-build-agent'
+    }
+
+    tools {
+        jdk   'JDK-17'
+        maven 'Maven-3.9'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
+        timeout(time: 90, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds(abortPrevious: true)
+        preserveStashes(buildCount: 3)
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        booleanParam(
+            name: 'SKIP_PERF_TESTS',
+            defaultValue: false,
+            description: 'Skip Gatling performance tests on staging (hotfix fast-track)'
+        )
+        string(
+            name: 'ROLLBACK_TO_IMAGE',
+            defaultValue: '',
+            description: 'Emergency rollback: full GCR image tag (e.g. gcr.io/cloudeagle-prod/sync-service:abc1234). Leave empty for normal deploy.'
+        )
+    }
+
+    environment {
+        APP_NAME       = 'sync-service'
+        GCP_PROJECT    = 'cloudeagle-prod'
+        GCP_REGION     = 'us-central1'
+        GCR_HOST       = 'gcr.io'
+        IMAGE_NAME     = "gcr.io/cloudeagle-prod/sync-service"
+        SLACK_CHANNEL  = '#deployments'
+        MAVEN_OPTS     = '-Xmx1536m -Djava.awt.headless=true'
+
+        TARGET_ENV     = resolveEnv(env.BRANCH_NAME ?: 'develop')
+
+        // Jenkins-managed credentials — values are never echoed to console
+        SONAR_TOKEN    = credentials('sonarqube-token')
+        SLACK_TOKEN    = credentials('slack-bot-token')
+
+        GCP_ZONE_QA      = 'us-central1-a'
+        GCP_ZONE_STAGING = 'us-central1-b'
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  STAGES
+    // ══════════════════════════════════════════════════════════════════════════
+
+    stages {
+
+        // ── 1. Checkout & Initialise ───────────────────────────────────────────
+        stage('Initialise') {
+            steps {
+                checkout scm
+
+                script {
+                    env.GIT_SHA     = shortSha()
+                    env.GIT_AUTHOR  = sh(script: 'git log -1 --format="%an <%ae>"', returnStdout: true).trim()
+                    env.GIT_MESSAGE = sh(script: 'git log -1 --format="%s"', returnStdout: true).trim()
+
+                    // Immutable image tag (commit SHA) + mutable env pointer
+                    env.IMAGE_TAG    = "${env.IMAGE_NAME}:${env.GIT_SHA}"
+                    env.IMAGE_LATEST = "${env.IMAGE_NAME}:${env.TARGET_ENV}-latest"
+
+                    def migMap = [
+                        qa:      "${env.APP_NAME}-qa",
+                        staging: "${env.APP_NAME}-staging",
+                        prod:    "${env.APP_NAME}-prod"
+                    ]
+                    env.MIG_NAME = migMap[env.TARGET_ENV]
+
+                    echo """
+╔══════════════════════════════════════════════════════════╗
+║  sync-service  CI/CD Pipeline  (Docker on GCP VMs)
+║  Branch    : ${env.BRANCH_NAME}
+║  Env       : ${env.TARGET_ENV}
+║  SHA       : ${env.GIT_SHA}
+║  Author    : ${env.GIT_AUTHOR}
+║  Message   : ${env.GIT_MESSAGE}
+║  Image tag : ${env.IMAGE_TAG}
+╚══════════════════════════════════════════════════════════╝"""
+                }
+
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: '#439FE0',
+                    message: """:hammer_and_wrench: *${env.APP_NAME}* build started
+*Branch:* \`${env.BRANCH_NAME}\` → \`${env.TARGET_ENV}\`
+*Commit:* ${env.GIT_SHA} — ${env.GIT_MESSAGE}
+*Author:* ${env.GIT_AUTHOR}
+*Build:* <${env.BUILD_URL}|#${env.BUILD_NUMBER}>"""
+                )
+            }
+        }
+
+        // ── 2. Rollback short-circuit ──────────────────────────────────────────
+        // Supply ROLLBACK_TO_IMAGE to skip build/test and deploy a previous image.
+        stage('Rollback Short-Circuit') {
+            when {
+                expression { return params.ROLLBACK_TO_IMAGE?.trim() }
+            }
+            steps {
+                script {
+                    echo "Emergency rollback to: ${params.ROLLBACK_TO_IMAGE.trim()}"
+                    sh """
+                        gcloud config set project ${env.GCP_PROJECT}
+                        chmod +x part1-cicd/scripts/rollback.sh
+                        part1-cicd/scripts/rollback.sh ${env.TARGET_ENV} '${params.ROLLBACK_TO_IMAGE.trim()}'
+                    """
+                    currentBuild.result = 'SUCCESS'
+                    throw new org.jenkinsci.plugins.workflow.steps.FlowInterruptedException(
+                        hudson.model.Result.SUCCESS
+                    )
+                }
+            }
+        }
+
+        // ── 3. Build JAR ───────────────────────────────────────────────────────
+        stage('Build') {
+            steps {
+                sh '''
+                    mvn clean package \
+                      -DskipTests \
+                      --batch-mode \
+                      --no-transfer-progress \
+                      -Dspring.profiles.active=ci
+                '''
+            }
+            post {
+                success {
+                    // Archive JAR in Jenkins for traceability; image is the deploy unit.
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true, allowEmptyArchive: false
+                }
+            }
+        }
+
+        // ── 4. Verify — parallel tests + static analysis ──────────────────────
+        stage('Verify') {
+            parallel {
+
+                stage('Unit Tests') {
+                    steps {
+                        sh '''
+                            mvn test \
+                              --batch-mode \
+                              --no-transfer-progress \
+                              -Dspring.profiles.active=test
+                        '''
+                    }
+                    post {
+                        always {
+                            junit testResults: 'target/surefire-reports/*.xml', allowEmptyResults: false
+                            recordCoverage(
+                                tools: [[parser: 'JACOCO', pattern: 'target/site/jacoco/jacoco.xml']],
+                                qualityGates: [
+                                    [threshold: 70.0, metric: 'LINE',   baseline: 'PROJECT'],
+                                    [threshold: 70.0, metric: 'BRANCH', baseline: 'PROJECT']
+                                ]
+                            )
+                        }
+                    }
+                }
+
+                stage('Static Analysis') {
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            sh '''
+                                mvn sonar:sonar \
+                                  -Dsonar.projectKey=${APP_NAME} \
+                                  -Dsonar.java.coveragePlugin=jacoco \
+                                  -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+                                  --batch-mode \
+                                  --no-transfer-progress
+                            '''
+                        }
+                    }
+                }
+
+                stage('Dependency Audit') {
+                    steps {
+                        sh '''
+                            mvn org.owasp:dependency-check-maven:9.0.9:check \
+                              -DfailBuildOnCVSS=8 \
+                              -DsuppressionFile=.owasp-suppressions.xml \
+                              --batch-mode \
+                              --no-transfer-progress
+                        '''
+                    }
+                    post {
+                        always {
+                            publishHTML([
+                                allowMissing: true,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'target',
+                                reportFiles: 'dependency-check-report.html',
+                                reportName: 'OWASP Dependency Check'
+                            ])
+                        }
+                    }
+                }
+
+            } // end parallel
+        }
+
+        // ── 5. Quality Gate ────────────────────────────────────────────────────
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ── 6. Docker Build ────────────────────────────────────────────────────
+        // Docker Engine runs on the build agent VM.
+        // gcloud auth configure-docker uses the VM's GCE service account
+        // via the metadata server — no docker login credentials in Jenkins.
+        stage('Docker Build') {
+            steps {
+                sh """
+                    # Authenticate Docker to GCR via GCE metadata SA (no key file)
+                    gcloud auth configure-docker ${env.GCR_HOST} --quiet
+
+                    cp target/*.jar target/sync-service.jar
+
+                    docker build \
+                      --file part1-cicd/Dockerfile \
+                      --build-arg BUILD_DATE="\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                      --build-arg VCS_REF=${env.GIT_SHA} \
+                      --build-arg VERSION=${env.BUILD_NUMBER} \
+                      --tag ${env.IMAGE_TAG} \
+                      --tag ${env.IMAGE_LATEST} \
+                      --label "git.sha=${env.GIT_SHA}" \
+                      --label "build.number=${env.BUILD_NUMBER}" \
+                      --label "build.branch=${env.BRANCH_NAME}" \
+                      .
+
+                    echo "=== Image built ==="
+                    docker images ${env.IMAGE_NAME}
+                """
+            }
+        }
+
+        // ── 7. Security Scan — Docker image CVE scan ───────────────────────────
+        // Trivy scans the built image for known vulnerabilities in OS packages
+        // and application dependencies. Fails the pipeline on unfixed HIGH/CRITICAL CVEs.
+        stage('Security Scan') {
+            steps {
+                sh """
+                    trivy image \
+                      --exit-code 1 \
+                      --severity HIGH,CRITICAL \
+                      --ignore-unfixed \
+                      --format sarif \
+                      --output trivy-results.sarif \
+                      --timeout 15m \
+                      ${env.IMAGE_TAG}
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-results.sarif', allowEmptyArchive: true
+                    recordIssues(
+                        tools: [sarif(pattern: 'trivy-results.sarif', id: 'trivy', name: 'Trivy CVEs')],
+                        qualityGates: [[threshold: 1, type: 'TOTAL_ERROR']]
+                    )
+                }
+            }
+        }
+
+        // ── 8. Push to GCR ────────────────────────────────────────────────────
+        // Push both the immutable SHA tag and the mutable env-latest tag.
+        // The SHA tag is what gets deployed; env-latest is a convenience pointer.
+        stage('Push to GCR') {
+            steps {
+                sh """
+                    docker push ${env.IMAGE_TAG}
+                    docker push ${env.IMAGE_LATEST}
+
+                    echo "=== Pushed ==="
+                    echo "  SHA tag  : ${env.IMAGE_TAG}"
+                    echo "  Env tag  : ${env.IMAGE_LATEST}"
+                """
+            }
+        }
+
+        // ── 9. Deploy to QA VMs ────────────────────────────────────────────────
+        // Rolling: VMs updated one-at-a-time via SSH (IAP tunnel + OS Login).
+        // Each VM: docker pull → docker stop → docker run.
+        stage('Deploy → QA') {
+            when { branch 'develop' }
+            steps {
+                sh """
+                    gcloud config set project ${env.GCP_PROJECT}
+                    chmod +x part1-cicd/scripts/deploy.sh \
+                             part1-cicd/scripts/health-check.sh \
+                             part1-cicd/scripts/rollback.sh
+
+                    part1-cicd/scripts/deploy.sh qa '${env.IMAGE_TAG}'
+                    part1-cicd/scripts/health-check.sh qa
+                """
+            }
+            post {
+                failure {
+                    echo 'QA deployment failed — initiating automated rollback'
+                    sh 'part1-cicd/scripts/rollback.sh qa'
+                }
+            }
+        }
+
+        // ── 10. Integration Tests ──────────────────────────────────────────────
+        stage('Integration Tests') {
+            when { branch 'develop' }
+            steps {
+                sh '''
+                    mvn verify \
+                      -Pintegration-tests \
+                      -Dtest.env=qa \
+                      --batch-mode \
+                      --no-transfer-progress
+                '''
+            }
+            post {
+                always {
+                    junit testResults: 'target/failsafe-reports/*.xml', allowEmptyResults: true
+                }
+            }
+        }
+
+        // ── 11. Deploy to Staging VMs ──────────────────────────────────────────
+        stage('Deploy → Staging') {
+            when { branch 'staging' }
+            steps {
+                sh """
+                    gcloud config set project ${env.GCP_PROJECT}
+                    chmod +x part1-cicd/scripts/deploy.sh \
+                             part1-cicd/scripts/health-check.sh \
+                             part1-cicd/scripts/rollback.sh
+
+                    part1-cicd/scripts/deploy.sh staging '${env.IMAGE_TAG}'
+                    part1-cicd/scripts/health-check.sh staging
+                """
+            }
+            post {
+                failure {
+                    echo 'Staging deployment failed — initiating automated rollback'
+                    sh 'part1-cicd/scripts/rollback.sh staging'
+                }
+            }
+        }
+
+        // ── 12. Performance Tests ──────────────────────────────────────────────
+        stage('Performance Tests') {
+            when {
+                allOf {
+                    branch 'staging'
+                    expression { return !params.SKIP_PERF_TESTS }
+                }
+            }
+            steps {
+                sh '''
+                    mvn gatling:test \
+                      -Pperformance \
+                      -Dgatling.env=staging \
+                      --batch-mode \
+                      --no-transfer-progress
+                '''
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'target/gatling',
+                        reportFiles: '**/index.html',
+                        reportName: 'Gatling Performance Report'
+                    ])
+                }
+            }
+        }
+
+        // ── 13. Production Approval Gate ───────────────────────────────────────
+        stage('Prod Approval') {
+            when { branch 'main' }
+            steps {
+                script {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: '#FFA500',
+                        message: """:warning: *${env.APP_NAME}* awaiting PRODUCTION approval
+*Image:* \`${env.IMAGE_TAG}\`
+*Commit:* ${env.GIT_SHA} — ${env.GIT_MESSAGE}
+*Author:* ${env.GIT_AUTHOR}
+*Approve here:* <${env.BUILD_URL}input|Jenkins Input>
+_Times out in 30 minutes._"""
+                    )
+
+                    def approval
+                    timeout(time: 30, unit: 'MINUTES') {
+                        approval = input(
+                            id: 'ProdDeploymentApproval',
+                            message: "Deploy ${env.APP_NAME} image ${env.GIT_SHA} to PRODUCTION VMs?",
+                            ok: 'Approve & Deploy',
+                            submitter: 'release-managers',
+                            submitterParameter: 'APPROVER',
+                            parameters: [
+                                booleanParam(
+                                    name: 'CONFIRM',
+                                    defaultValue: false,
+                                    description: '☑ I confirm this image has been smoke-tested on staging'
+                                ),
+                                string(
+                                    name: 'CHANGE_TICKET',
+                                    defaultValue: '',
+                                    description: 'Change ticket (e.g. CHG-1234) — REQUIRED'
+                                ),
+                                text(
+                                    name: 'NOTES',
+                                    defaultValue: '',
+                                    description: 'Optional notes / rollback plan'
+                                )
+                            ]
+                        )
+                    }
+
+                    if (!approval.CONFIRM) {
+                        error('Deployment rejected: confirmation checkbox was not checked.')
+                    }
+                    if (!approval.CHANGE_TICKET?.trim()) {
+                        error('Deployment rejected: change management ticket is required.')
+                    }
+
+                    env.APPROVED_BY    = approval.APPROVER
+                    env.CHANGE_TICKET  = approval.CHANGE_TICKET.trim()
+                    env.APPROVAL_NOTES = approval.NOTES?.trim() ?: 'None'
+                    echo "Approved by: ${env.APPROVED_BY} | Ticket: ${env.CHANGE_TICKET}"
+                }
+            }
+        }
+
+        // ── 14. Blue/Green Deploy to Production VMs ────────────────────────────
+        // deploy.sh detects 'prod' and runs the blue/green flow:
+        //   → deploy image to idle MIG VMs in parallel
+        //   → health-check idle MIG (zero traffic)
+        //   → switch GCP LB backend to new MIG (< 5 seconds)
+        stage('Deploy → Production') {
+            when { branch 'main' }
+            steps {
+                sh """
+                    gcloud config set project ${env.GCP_PROJECT}
+                    chmod +x part1-cicd/scripts/deploy.sh \
+                             part1-cicd/scripts/health-check.sh \
+                             part1-cicd/scripts/rollback.sh
+
+                    export APPROVED_BY="${env.APPROVED_BY}"
+                    export CHANGE_TICKET="${env.CHANGE_TICKET}"
+                    export BUILD_NUMBER="${env.BUILD_NUMBER}"
+
+                    part1-cicd/scripts/deploy.sh prod '${env.IMAGE_TAG}'
+                    part1-cicd/scripts/health-check.sh prod
+                """
+            }
+            post {
+                failure {
+                    echo 'Production deployment failed — triggering blue/green LB rollback'
+                    sh 'part1-cicd/scripts/rollback.sh prod'
+                }
+            }
+        }
+
+    } // end stages
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  POST
+    // ══════════════════════════════════════════════════════════════════════════
+
+    post {
+        success {
+            script {
+                def envEmoji = [qa: ':test_tube:', staging: ':mag:', prod: ':rocket:'][env.TARGET_ENV] ?: ':white_check_mark:'
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'good',
+                    message: """${envEmoji} *${env.APP_NAME}* deployed to \`${env.TARGET_ENV}\` (Docker on GCP VMs)
+*Build:* <${env.BUILD_URL}|#${env.BUILD_NUMBER}> | *Image:* \`${env.GIT_SHA}\`
+*Author:* ${env.GIT_AUTHOR}${env.TARGET_ENV == 'prod' ? "\n*Approved by:* ${env.APPROVED_BY} — Ticket: ${env.CHANGE_TICKET}" : ''}"""
+                )
+                if (env.TARGET_ENV == 'prod') {
+                    slackSend(
+                        channel: '#prod-releases',
+                        color: 'good',
+                        message: """:rocket: *PRODUCTION RELEASE* — ${env.APP_NAME}
+*Image:* \`${env.IMAGE_TAG}\`
+*Commit:* ${env.GIT_SHA} — ${env.GIT_MESSAGE}
+*Approved by:* ${env.APPROVED_BY} | *Ticket:* ${env.CHANGE_TICKET}
+*Notes:* ${env.APPROVAL_NOTES}"""
+                    )
+                }
+            }
+        }
+
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: """:x: *${env.APP_NAME}* pipeline FAILED
+*Branch:* \`${env.BRANCH_NAME}\` → \`${env.TARGET_ENV}\`
+*Failed stage:* ${env.STAGE_NAME}
+*Build:* <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+*Author:* ${env.GIT_AUTHOR}
+:point_right: <${env.BUILD_URL}console|View console log>"""
+            )
+        }
+
+        aborted {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'warning',
+                message: """:no_entry: *${env.APP_NAME}* pipeline ABORTED
+*Branch:* \`${env.BRANCH_NAME}\` → \`${env.TARGET_ENV}\`
+*Build:* <${env.BUILD_URL}|#${env.BUILD_NUMBER}>"""
+            )
+        }
+
+        always {
+            // Remove local images from build agent to reclaim disk space
+            sh """
+                docker rmi ${env.IMAGE_TAG}    2>/dev/null || true
+                docker rmi ${env.IMAGE_LATEST} 2>/dev/null || true
+                docker image prune -f          2>/dev/null || true
+            """
+            cleanWs(cleanWhenAborted: true, cleanWhenFailure: true, cleanWhenSuccess: true, deleteDirs: true, notFailBuild: true)
+        }
+    }
+}
