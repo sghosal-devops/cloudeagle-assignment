@@ -20,7 +20,7 @@ Spring Boot service (`sync-service`) — CI/CD design for GCP VM deployment (Par
 │
 └── part2-infrastructure-cloud-run/
     ├── INFRASTRUCTURE-DESIGN.md                      ← Cloud Run infrastructure proposal with full justification
-    └── sync-service-cloud-run-architecture.svg       ← Architecture diagram
+    └── cloudrun.drawio.png                           ← Architecture diagram
 ```
 
 ---
@@ -105,4 +105,4 @@ Cloud Run is the right starting point. Migration to **GKE Autopilot** is warrant
 | How does deployment / rollback work? | [part1-cicd/scripts/deploy.sh](part1-cicd/scripts/deploy.sh) · [part1-cicd/scripts/rollback.sh](part1-cicd/scripts/rollback.sh) |
 | How are health checks done post-deploy? | [part1-cicd/scripts/health-check.sh](part1-cicd/scripts/health-check.sh) |
 | What infrastructure is proposed? | [part2-infrastructure-cloud-run/INFRASTRUCTURE-DESIGN.md](part2-infrastructure-cloud-run/INFRASTRUCTURE-DESIGN.md) |
-| Show me the architecture diagram | [part2-infrastructure-cloud-run/sync-service-cloud-run-architecture.svg](part2-infrastructure-cloud-run/sync-service-cloud-run-architecture.svg) |
+| Show me the architecture diagram | [part2-infrastructure-cloud-run/cloudrun.drawio.png](part2-infrastructure-cloud-run/cloudrun.drawio.png) |
