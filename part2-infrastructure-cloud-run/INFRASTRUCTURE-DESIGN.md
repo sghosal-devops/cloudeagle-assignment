@@ -50,6 +50,15 @@ This keeps the initial platform simple while still leaving a path to GKE Autopil
 | CPU allocation | CPU during request processing; use always-allocated CPU only if background work is required |
 | Autoscaling | Native Cloud Run autoscaling based on request load |
 
+### Cold Start Consideration
+
+Spring Boot has a non-trivial JVM startup time (typically 10–30 seconds). On Cloud Run with `min_instances=0`, the first request after a period of inactivity hits a cold start. Mitigations:
+
+- Set `min_instances=1` in production if cold starts are unacceptable (small fixed cost, eliminates the problem).
+- Add JVM flags `-XX:TieredStopAtLevel=1` to reduce startup time by ~30–40% at the cost of peak throughput — acceptable for a startup at low traffic volumes.
+- The startup probe (`failure_threshold=30`, `period_seconds=10`) gives the JVM 300 seconds to become healthy before Cloud Run marks the revision as failed.
+- For QA/staging, cold starts are acceptable — `min_instances=0` keeps cost at zero when idle.
+
 If `sync-service` has scheduled/background sync jobs, I would split them from the HTTP API:
 
 - Cloud Run service for HTTP/API traffic.
@@ -116,6 +125,8 @@ VPC: sync-vpc  (10.0.0.0/16)
 Client → Cloud Armor (WAF + rate limit) → External HTTPS Load Balancer
        → Serverless NEG → Cloud Run revision (managed TLS terminates at LB)
 ```
+
+A **Serverless Network Endpoint Group (NEG)** is the GCP component that connects the External HTTPS Load Balancer to a Cloud Run service. It is a lightweight pointer — no VMs or persistent infrastructure — that lets Cloud Armor and the LB front any Cloud Run revision. Without it, Cloud Run's built-in managed HTTPS is used directly (sufficient for QA/staging); the Serverless NEG + LB layer is added for production to enable Cloud Armor WAF rules and rate limiting.
 
 Cloud Armor rules applied to production:
 - OWASP Core Rule Set (managed rule group)

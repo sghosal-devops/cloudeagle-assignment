@@ -19,10 +19,8 @@ Spring Boot service (`sync-service`) — CI/CD design for GCP VM deployment (Par
 │       └── health-check.sh     ← 7 per-VM checks: SSH, docker inspect, actuator, liveness, readiness, MongoDB
 │
 └── part2-infrastructure-cloud-run/
-    ├── INFRASTRUCTURE-DESIGN.md    ← Cloud Run infrastructure proposal with full justification
-    └── architecture/
-        ├── diagram.md              ← Mermaid diagrams: architecture + CI/CD deployment flow
-        └── sync-service-cloud-run-architecture.svg   ← Rendered architecture diagram
+    ├── INFRASTRUCTURE-DESIGN.md                      ← Cloud Run infrastructure proposal with full justification
+    └── sync-service-cloud-run-architecture.svg       ← Architecture diagram
 ```
 
 ---
@@ -86,6 +84,7 @@ The assignment asks to propose a startup-appropriate infrastructure. Rather than
 | **Ingress** | Cloud Run managed HTTPS + optional Cloud Armor | TLS handled by Google; WAF added when needed |
 | **Secrets** | Secret Manager injected as env vars into Cloud Run | No key files; IAM-scoped per environment |
 | **Deployment** | Revision-based canary: 0% → 10% → 50% → 100% | Same blue/green outcome without maintaining two VM groups |
+| **Cold start** | `min_instances=1` in prod + `-XX:TieredStopAtLevel=1` JVM flag | Eliminates cold start penalty for Spring Boot; `min_instances=0` kept for QA/staging to save cost |
 | **CI/CD link** | Same Docker image from GCR/Artifact Registry, deployed via `gcloud run deploy` | Part 1 pipeline pushes the image; Part 2 deploys it |
 
 The same Docker image built and scanned in Part 1 is deployed to Cloud Run — no rebuild needed. The deployment step changes from `deploy.sh` (VM SSH) to `gcloud run deploy` (serverless revision).
@@ -106,4 +105,4 @@ Cloud Run is the right starting point. Migration to **GKE Autopilot** is warrant
 | How does deployment / rollback work? | [part1-cicd/scripts/deploy.sh](part1-cicd/scripts/deploy.sh) · [part1-cicd/scripts/rollback.sh](part1-cicd/scripts/rollback.sh) |
 | How are health checks done post-deploy? | [part1-cicd/scripts/health-check.sh](part1-cicd/scripts/health-check.sh) |
 | What infrastructure is proposed? | [part2-infrastructure-cloud-run/INFRASTRUCTURE-DESIGN.md](part2-infrastructure-cloud-run/INFRASTRUCTURE-DESIGN.md) |
-| Show me the architecture diagram | [part2-infrastructure-cloud-run/architecture/diagram.md](part2-infrastructure-cloud-run/architecture/diagram.md) |
+| Show me the architecture diagram | [part2-infrastructure-cloud-run/sync-service-cloud-run-architecture.svg](part2-infrastructure-cloud-run/sync-service-cloud-run-architecture.svg) |
